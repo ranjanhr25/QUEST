@@ -1,117 +1,196 @@
 """
-I/O helpers: checkpoint save/load, memory-mapped embedding arrays.
+I/O utilities for QUEST.
 
-Memory-mapped arrays let us store millions of frame embeddings on disk
-and access them without loading everything into RAM — essential when
-a dataset has 50k+ videos.
+Covers:
+  - Checkpoint save / load (model + optimiser + metadata).
+  - Float16 numpy memmap creation and loading.
+  - Video-to-row index for the embeddings memmap.
+  - Atomic file writes (write-then-rename) to avoid corrupt checkpoints.
 """
+
 from __future__ import annotations
 
-import numpy as np
-import torch
+import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
+
 from src.utils.logger import get_logger
 
-logger = get_logger(__name__)
+log = get_logger("io_utils")
 
 
-# ── Checkpoints ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Checkpoint utilities
+# ---------------------------------------------------------------------------
 
 def save_checkpoint(
+    path: str | Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: Any | None,
+    step: int,
     epoch: int,
-    metrics: dict[str, float],
-    save_path: str,
+    metrics: dict[str, float] | None = None,
+    fp16: bool = False,
 ) -> None:
     """
-    Save model weights, optimizer state, epoch, and metrics to disk.
+    Atomically save a training checkpoint.
 
-    Args:
-        model:     PyTorch model to save.
-        optimizer: Optimizer whose state to include.
-        epoch:     Current epoch number.
-        metrics:   Dict of metric name → value to record alongside checkpoint.
-        save_path: Full path including filename, e.g. "results/checkpoints/epoch_3.pt".
+    Writes to a temp file first, then renames to avoid corruption on crash.
+    If fp16=True the model state dict is stored in half precision (~50% smaller).
     """
-    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "metrics": metrics,
-        },
-        save_path,
-    )
-    logger.info(f"Checkpoint saved → {save_path}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    state = model.state_dict()
+    if fp16:
+        state = {k: v.half() for k, v in state.items()}
+
+    payload = {
+        "model_state": state,
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler else None,
+        "step": step,
+        "epoch": epoch,
+        "metrics": metrics or {},
+    }
+
+    # Atomic write
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        os.close(tmp_fd)
+        torch.save(payload, tmp_path)
+        shutil.move(tmp_path, path)
+        log.info("Checkpoint saved", path=str(path), step=step, epoch=epoch)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def load_checkpoint(
+    path: str | Path,
     model: torch.nn.Module,
-    checkpoint_path: str,
     optimizer: torch.optim.Optimizer | None = None,
-    device: str = "cpu",
+    scheduler: Any | None = None,
+    device: str | torch.device = "cpu",
+    strict: bool = True,
 ) -> dict[str, Any]:
     """
-    Load checkpoint into model (and optionally optimizer).
-
-    Args:
-        model:           Model to load weights into.
-        checkpoint_path: Path to .pt checkpoint file.
-        optimizer:       If provided, optimizer state is also restored.
-        device:          Device to map tensors to.
-
-    Returns:
-        The full checkpoint dict (contains epoch, metrics, etc.).
+    Load a checkpoint.  Returns the metadata dict (step, epoch, metrics).
+    Model weights are cast back to fp32 automatically if they were saved in fp16.
     """
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    if optimizer is not None:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    logger.info(f"Loaded checkpoint from {checkpoint_path} (epoch {ckpt['epoch']})")
-    return ckpt
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    payload = torch.load(path, map_location=device, weights_only=False)
+
+    # Cast fp16 → fp32 before loading
+    state = {k: v.float() if v.dtype == torch.float16 else v
+             for k, v in payload["model_state"].items()}
+    missing, unexpected = model.load_state_dict(state, strict=strict)
+    if missing:
+        log.warning("Missing keys in checkpoint", keys=missing)
+    if unexpected:
+        log.warning("Unexpected keys in checkpoint", keys=unexpected)
+
+    if optimizer is not None and payload.get("optimizer_state"):
+        optimizer.load_state_dict(payload["optimizer_state"])
+    if scheduler is not None and payload.get("scheduler_state"):
+        scheduler.load_state_dict(payload["scheduler_state"])
+
+    log.info("Checkpoint loaded", path=str(path),
+             step=payload.get("step"), epoch=payload.get("epoch"))
+    return {"step": payload.get("step", 0),
+            "epoch": payload.get("epoch", 0),
+            "metrics": payload.get("metrics", {})}
 
 
-# ── Memory-mapped embedding storage ───────────────────────────────────────────
+def find_latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
+    """Return the most recent .pt file in checkpoint_dir, or None."""
+    checkpoint_dir = Path(checkpoint_dir)
+    pts = sorted(checkpoint_dir.glob("*.pt"))
+    return pts[-1] if pts else None
 
-def save_embeddings_memmap(
-    embeddings: np.ndarray,
-    save_path: str,
-) -> None:
+
+# ---------------------------------------------------------------------------
+# Memmap utilities
+# ---------------------------------------------------------------------------
+
+def create_memmap(
+    path: str | Path,
+    shape: tuple[int, ...],
+    dtype: np.dtype | str = np.float16,
+) -> np.ndarray:
+    """Create (or overwrite) a float16 numpy memmap at *path*."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.memmap(path, dtype=dtype, mode="w+", shape=shape)
+    log.info("Memmap created", path=str(path), shape=shape, dtype=str(dtype))
+    return arr
+
+
+def open_memmap(
+    path: str | Path,
+    shape: tuple[int, ...],
+    dtype: np.dtype | str = np.float16,
+    mode: str = "r",
+) -> np.ndarray:
+    """Open an existing memmap in read (or copy-on-write) mode."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Memmap not found: {path}")
+    return np.memmap(path, dtype=dtype, mode=mode, shape=shape)
+
+
+# ---------------------------------------------------------------------------
+# Video-to-row index
+# ---------------------------------------------------------------------------
+
+def save_video_index(index: dict[str, tuple[int, int]], path: str | Path) -> None:
     """
-    Save a float32 embedding matrix to a memory-mapped file.
+    Save a mapping  video_id (str) → (start_row, end_row)  as JSON.
 
-    The shape is stored in a companion .meta.npy file so we can
-    reload it without knowing dimensions ahead of time.
-
-    Args:
-        embeddings: Array of shape (N, D) where N = number of frames, D = embed dim.
-        save_path:  Path to .npy file (companion .meta.npy is auto-created).
+    This lets us slice the embeddings memmap cheaply: given a video_id,
+    frames are at rows [start_row : end_row].
     """
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    mm = np.memmap(save_path, dtype="float32", mode="w+", shape=embeddings.shape)
-    mm[:] = embeddings[:]
-    mm.flush()
-
-    np.save(str(save_path) + ".meta.npy", np.array(embeddings.shape))
-    logger.info(f"Embeddings saved ({embeddings.shape}) → {save_path}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialisable = {k: list(v) for k, v in index.items()}
+    with open(path, "w") as f:
+        json.dump(serialisable, f, indent=2)
+    log.info("Video index saved", path=str(path), n_videos=len(index))
 
 
-def load_embeddings_memmap(save_path: str, mode: str = "r") -> np.memmap:
-    """
-    Load a memory-mapped embedding file.
+def load_video_index(path: str | Path) -> dict[str, tuple[int, int]]:
+    """Load video_id → (start_row, end_row) index from JSON."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Video index not found: {path}")
+    with open(path) as f:
+        raw = json.load(f)
+    return {k: tuple(v) for k, v in raw.items()}
 
-    Args:
-        save_path: Path to the .npy file written by save_embeddings_memmap.
-        mode:      "r" (read-only) or "r+" (read-write). Always use "r" for inference.
 
-    Returns:
-        numpy.memmap of shape (N, D) — reads from disk on access, not loaded into RAM.
-    """
-    shape = tuple(np.load(str(save_path) + ".meta.npy").tolist())
-    return np.memmap(save_path, dtype="float32", mode=mode, shape=shape)
+# ---------------------------------------------------------------------------
+# Frame-list index  (video_id → list[frame_path])
+# ---------------------------------------------------------------------------
+
+def save_frame_index(index: dict[str, list[str]], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(index, f)
+    log.info("Frame index saved", path=str(path))
+
+
+def load_frame_index(path: str | Path) -> dict[str, list[str]]:
+    with open(path) as f:
+        return json.load(f)

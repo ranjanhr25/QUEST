@@ -1,167 +1,307 @@
 """
-Cross-modal temporal ranker — Stage 2 of the QUEST pipeline.
+Cross-modal Transformer Ranker for QUEST (Stage 2).
 
 Architecture:
-  1. A linear projection maps CLIP question embedding → ranker embedding space.
-  2. A linear projection maps each CLIP frame embedding → ranker embedding space.
-  3. A small Transformer encoder cross-attends question tokens to frame embeddings,
-     producing a context-aware representation for each candidate frame.
-  4. A temporal MLP fuses [frame_repr, temporal_pos_embedding, cross_attn_output].
-  5. Two output heads:
-     - Relevance head: scalar score per frame (higher = more relevant to question)
-     - Uncertainty head: scalar for the full candidate set (used by adaptive budget)
+  - Input: K candidate frame embeddings (D-dim) + 1 question embedding (D-dim).
+  - Positional encoding: scene-boundary-aware temporal embedding (novel contribution).
+  - Cross-attention: question as query, frame embeddings as key/value.
+  - Self-attention: frames attend to each other for temporal coherence.
+  - Output heads:
+      relevance_scores: (K,)   — per-frame relevance to the question.
+      uncertainty:      scalar — 1 = retrieval uncertain, 0 = confident.
 
-The model is small enough (~50M params) to train from scratch on Kaggle free T4s
-in under 3 hours. No pretraining needed — the CLIP embeddings are already rich.
-
-Training objective: contrastive ranking loss with in-batch negatives.
+Total parameters: ~50M (4 layers, 8 heads, hidden_dim=512).
 """
+
 from __future__ import annotations
+
+import math
+from typing import Any
 
 import torch
 import torch.nn as nn
-from einops import rearrange
+import torch.nn.functional as F
 
+
+# ---------------------------------------------------------------------------
+# Scene-boundary-aware Temporal Embedding  (Novel Contribution)
+# ---------------------------------------------------------------------------
+
+class SceneBoundaryTemporalEmbedding(nn.Module):
+    """
+    Encodes each frame's temporal position using two signals:
+      1. Absolute temporal position (frame_idx / total_frames).
+      2. Relative position to nearest scene boundary
+         (distance_to_nearest_boundary / scene_length).
+
+    Scene boundaries are detected as frames where consecutive CLIP similarity
+    drops below a threshold (cosine distance spike).
+
+    Both signals are projected to hidden_dim/2 and concatenated.
+    """
+
+    def __init__(self, hidden_dim: int, max_len: int = 4500) -> None:
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        half = hidden_dim // 2
+
+        # Sinusoidal base (absolute position)
+        pe = torch.zeros(max_len, half)
+        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, half, 2).float() * (-math.log(10000.0) / half))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div[:half // 2])
+        self.register_buffer("abs_pe", pe)  # (max_len, half)
+
+        # Learnable projection for boundary-relative position
+        self.boundary_proj = nn.Sequential(
+            nn.Linear(2, half),   # input: [scene_progress, dist_to_boundary_norm]
+            nn.GELU(),
+            nn.Linear(half, half),
+        )
+
+        # Merge projection
+        self.merge = nn.Linear(hidden_dim, hidden_dim)
+
+    def detect_boundaries(
+        self, frame_embs: torch.Tensor, threshold: float = 0.3
+    ) -> list[int]:
+        """
+        Detect scene boundaries from CLIP frame embeddings.
+        A boundary occurs where cosine similarity between consecutive frames
+        drops below (1 - threshold).
+
+        Args:
+            frame_embs: (K, D) tensor, L2-normalised.
+            threshold:  cosine distance threshold.
+
+        Returns:
+            List of boundary frame indices (including 0 and K-1).
+        """
+        if frame_embs.shape[0] <= 1:
+            return [0]
+        sims = (frame_embs[:-1] * frame_embs[1:]).sum(dim=-1)  # (K-1,)
+        boundaries = [0]
+        for i, s in enumerate(sims.tolist()):
+            if s < (1.0 - threshold):
+                boundaries.append(i + 1)
+        boundaries.append(frame_embs.shape[0] - 1)
+        return boundaries
+
+    def forward(
+        self,
+        temporal_pos: torch.Tensor,    # (B, K) normalised 0-1 frame positions
+        frame_embs: torch.Tensor,      # (B, K, D) for boundary detection
+    ) -> torch.Tensor:                 # (B, K, hidden_dim)
+        B, K, D = frame_embs.shape
+
+        # 1. Absolute position embedding
+        # Convert normalised position to integer indices (scaled to max_len)
+        max_len = self.abs_pe.shape[0]
+        abs_idx = (temporal_pos * (max_len - 1)).long().clamp(0, max_len - 1)  # (B, K)
+        abs_emb = self.abs_pe[abs_idx]  # (B, K, half)
+
+        # 2. Scene-boundary-relative embedding
+        boundary_feats = torch.zeros(B, K, 2, device=frame_embs.device)
+        for b in range(B):
+            boundaries = self.detect_boundaries(frame_embs[b])  # list of ints
+            n_frames = K
+            for fi in range(n_frames):
+                # Find which scene this frame belongs to
+                scene_start = max(j for j in boundaries if j <= fi)
+                scene_end_candidates = [j for j in boundaries if j > fi]
+                scene_end = scene_end_candidates[0] if scene_end_candidates else n_frames - 1
+
+                scene_len = max(scene_end - scene_start, 1)
+                scene_progress = (fi - scene_start) / scene_len  # 0→1 within scene
+                dist_to_end = (scene_end - fi) / scene_len       # 0→1 to scene end
+
+                boundary_feats[b, fi, 0] = scene_progress
+                boundary_feats[b, fi, 1] = dist_to_end
+
+        boundary_emb = self.boundary_proj(boundary_feats)  # (B, K, half)
+
+        # 3. Concatenate and merge
+        combined = torch.cat([abs_emb, boundary_emb], dim=-1)  # (B, K, hidden_dim)
+        return self.merge(combined)
+
+
+# ---------------------------------------------------------------------------
+# Transformer Ranker
+# ---------------------------------------------------------------------------
 
 class TemporalRanker(nn.Module):
     """
-    Cross-modal transformer that scores candidate frames given a question.
+    Cross-modal Transformer Ranker.
+
+    Takes K candidate frame embeddings + 1 question embedding,
+    outputs per-frame relevance scores and an uncertainty scalar.
 
     Args:
-        embed_dim:   Input embedding dimension (must match CLIP output, default 512).
-        hidden_dim:  Internal hidden dimension of the transformer.
-        num_heads:   Number of attention heads in the cross-attention layer.
-        num_layers:  Number of transformer encoder layers.
-        dropout:     Dropout rate applied inside the transformer.
-
-    Inputs (forward):
-        question_emb:  Tensor of shape (B, embed_dim) — one question per sample.
-        frame_embs:    Tensor of shape (B, K, embed_dim) — K candidate frames.
-        temporal_pos:  Tensor of shape (B, K, 3) — temporal position features
-                       [absolute_pos, scene_relative_pos, scene_id] per frame.
-
-    Outputs (forward):
-        relevance_scores: Tensor of shape (B, K) — per-frame relevance scores.
-        uncertainty:      Tensor of shape (B,) — uncertainty of the retrieved set.
+        embed_dim:   CLIP embedding dimension (input, e.g. 512).
+        hidden_dim:  Transformer hidden dimension.
+        num_layers:  Number of encoder layers.
+        num_heads:   Attention heads.
+        ffn_dim:     FFN intermediate dimension.
+        dropout:     Dropout probability.
+        max_frames:  Maximum K (for temporal embedding).
     """
 
     def __init__(
         self,
         embed_dim: int = 512,
-        hidden_dim: int = 256,
+        hidden_dim: int = 512,
+        num_layers: int = 4,
         num_heads: int = 8,
-        num_layers: int = 3,
+        ffn_dim: int = 2048,
         dropout: float = 0.1,
-    ):
+        max_frames: int = 4500,
+    ) -> None:
         super().__init__()
 
-        # Project CLIP embeddings into ranker space
-        self.question_proj = nn.Linear(embed_dim, hidden_dim)
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+
+        # Project CLIP embeddings into transformer space
         self.frame_proj = nn.Linear(embed_dim, hidden_dim)
+        self.query_proj = nn.Linear(embed_dim, hidden_dim)
 
-        # Scene-boundary-aware temporal position embedding (3 features → hidden_dim)
-        self.temporal_mlp = nn.Sequential(
-            nn.Linear(3, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-        )
+        # Scene-boundary-aware temporal encoding
+        self.temporal_emb = SceneBoundaryTemporalEmbedding(hidden_dim, max_len=max_frames)
 
-        # Cross-modal transformer: question attends to frames
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,          # expects (B, seq, dim)
-            norm_first=True,           # pre-norm is more stable for small models
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Cross-attention: question attends to frame embeddings
+        self.cross_attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+            for _ in range(num_layers)
+        ])
 
-        # Fusion: combine frame repr + temporal pos + cross-attn output
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        # Self-attention: frames attend to each other
+        self.self_attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+            for _ in range(num_layers)
+        ])
+
+        # Layer norms
+        self.cross_ln = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.self_ln  = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+        self.ffn_ln   = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(num_layers)])
+
+        # FFN
+        self.ffn_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, ffn_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(ffn_dim, hidden_dim),
+                nn.Dropout(dropout),
+            )
+            for _ in range(num_layers)
+        ])
 
         # Output heads
-        self.relevance_head = nn.Linear(hidden_dim, 1)   # per-frame score
-        self.uncertainty_head = nn.Sequential(           # per-set uncertainty
-            nn.Linear(hidden_dim, hidden_dim // 2),
+        self.relevance_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 256),
             nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
+            nn.Dropout(dropout),
+            nn.Linear(256, 1),
+        )
+        # Uncertainty head: pool over frames then predict scalar
+        self.uncertainty_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 1),
             nn.Sigmoid(),
         )
 
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(
         self,
-        question_emb: torch.Tensor,    # (B, embed_dim)
-        frame_embs: torch.Tensor,      # (B, K, embed_dim)
-        temporal_pos: torch.Tensor,    # (B, K, 3)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        frame_embs: torch.Tensor,    # (B, K, embed_dim)
+        q_emb: torch.Tensor,         # (B, embed_dim) or (B, 1, embed_dim)
+        temporal_pos: torch.Tensor,  # (B, K) normalised positions in [0, 1]
+        pad_mask: torch.Tensor | None = None,  # (B, K) True = padded
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            frame_embs:  (B, K, D) CLIP frame embeddings (L2-normalised).
+            q_emb:       (B, D)    CLIP question embedding (L2-normalised).
+            temporal_pos:(B, K)    normalised temporal positions.
+            pad_mask:    (B, K)    True for padded (invalid) frames.
 
+        Returns dict with:
+            relevance:   (B, K) raw relevance scores (pre-softmax).
+            uncertainty: (B,)   uncertainty in [0, 1].
+        """
         B, K, _ = frame_embs.shape
 
-        # Project into hidden space
-        q = self.question_proj(question_emb)              # (B, hidden_dim)
-        f = self.frame_proj(frame_embs)                   # (B, K, hidden_dim)
-        t = self.temporal_mlp(temporal_pos)               # (B, K, hidden_dim)
+        # Project inputs
+        x = self.frame_proj(frame_embs)                     # (B, K, H)
+        q = self.query_proj(q_emb).unsqueeze(1)             # (B, 1, H)
 
-        # Prepend question as a CLS-like token, then run transformer
-        q_token = q.unsqueeze(1)                          # (B, 1, hidden_dim)
-        sequence = torch.cat([q_token, f + t], dim=1)    # (B, K+1, hidden_dim)
-        encoded = self.transformer(sequence)              # (B, K+1, hidden_dim)
+        # Add temporal positional embedding
+        pos_emb = self.temporal_emb(temporal_pos, frame_embs)  # (B, K, H)
+        x = x + pos_emb
 
-        # Split back: first token is question ctx, rest are frame representations
-        q_ctx = encoded[:, 0, :]                          # (B, hidden_dim)
-        f_ctx = encoded[:, 1:, :]                         # (B, K, hidden_dim)
+        # Prepare padding mask for attention (True = ignore)
+        attn_key_mask = pad_mask if pad_mask is not None else None
 
-        # Fuse frame repr, temporal pos, and cross-attended context
-        q_expanded = q_ctx.unsqueeze(1).expand(-1, K, -1)
-        fused = self.fusion(torch.cat([f_ctx, t, q_expanded], dim=-1))  # (B, K, hidden_dim)
+        # Transformer layers: alternating cross-attention and self-attention
+        for i in range(len(self.cross_attention_layers)):
+            # Cross-attention: query attends to frames
+            attended_q, _ = self.cross_attention_layers[i](
+                query=q, key=x, value=x,
+                key_padding_mask=attn_key_mask,
+            )  # (B, 1, H)
+            q = self.cross_ln[i](q + attended_q)
 
-        # Score each frame
-        relevance_scores = self.relevance_head(fused).squeeze(-1)        # (B, K)
+            # Self-attention: frames attend to each other
+            attended_x, _ = self.self_attention_layers[i](
+                query=x, key=x, value=x,
+                key_padding_mask=attn_key_mask,
+            )  # (B, K, H)
+            x = self.self_ln[i](x + attended_x)
 
-        # Compute set-level uncertainty from mean pooled representation
-        mean_repr = fused.mean(dim=1)                                    # (B, hidden_dim)
-        uncertainty = self.uncertainty_head(mean_repr).squeeze(-1)       # (B,)
+            # FFN on frames
+            x = self.ffn_ln[i](x + self.ffn_layers[i](x))
 
-        return relevance_scores, uncertainty
+        # Relevance scores (B, K)
+        relevance = self.relevance_head(x).squeeze(-1)  # (B, K)
+        if pad_mask is not None:
+            relevance = relevance.masked_fill(pad_mask, float("-inf"))
 
+        # Uncertainty: pool over valid frames → scalar
+        if pad_mask is not None:
+            valid_mask = ~pad_mask  # (B, K)
+            pooled = (x * valid_mask.unsqueeze(-1).float()).sum(1)
+            pooled = pooled / valid_mask.float().sum(1, keepdim=True).clamp(min=1)
+        else:
+            pooled = x.mean(1)  # (B, H)
 
-def contrastive_ranking_loss(
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    margin: float = 0.2,
-) -> torch.Tensor:
-    """
-    Pairwise margin ranking loss.
+        uncertainty = self.uncertainty_head(pooled).squeeze(-1)  # (B,)
 
-    For each (positive, negative) frame pair in the batch, the positive
-    frame should score at least `margin` higher than the negative.
+        return {"relevance": relevance, "uncertainty": uncertainty}
 
-    Args:
-        scores: Tensor of shape (B, K) — ranker output scores.
-        labels: Tensor of shape (B, K) — 1 for relevant frames, 0 for irrelevant.
-        margin: Minimum score gap between positive and negative frames.
+    @classmethod
+    def from_config(cls, cfg: Any) -> "TemporalRanker":
+        r = cfg.ranking
+        return cls(
+            embed_dim=cfg.retrieval.embed_dim,
+            hidden_dim=r.hidden_dim,
+            num_layers=r.num_layers,
+            num_heads=r.num_heads,
+            ffn_dim=r.ffn_dim,
+            dropout=r.dropout,
+        )
 
-    Returns:
-        Scalar loss tensor.
-    """
-    loss = torch.tensor(0.0, device=scores.device)
-    count = 0
-
-    for b in range(scores.shape[0]):
-        pos_mask = labels[b] == 1
-        neg_mask = labels[b] == 0
-        if pos_mask.sum() == 0 or neg_mask.sum() == 0:
-            continue
-        pos_scores = scores[b][pos_mask]
-        neg_scores = scores[b][neg_mask]
-        # All (pos, neg) pairs
-        pairs = pos_scores.unsqueeze(1) - neg_scores.unsqueeze(0)  # (P, N)
-        loss += torch.clamp(margin - pairs, min=0).mean()
-        count += 1
-
-    return loss / max(count, 1)
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

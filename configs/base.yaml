@@ -1,62 +1,59 @@
-# configs/base.yaml
-# Default hyperparameters — dataset-specific configs override these
+# QUEST base configuration
+# All dataset-specific configs inherit and override these values.
 
 data:
-  fps: 1
-  max_frames_per_video: 1000
-  frame_size: 224
-
-clip:
-  model_name: "ViT-B-32"
-  pretrained: "openai"
-  batch_size: 256
-  device: "cuda"
+  fps: 1                          # frames per second to extract
+  frame_ext: "jpg"                # frame image extension
+  frame_quality: 90               # JPEG quality (0-100)
+  max_workers: 8                  # parallel workers for frame extraction
+  batch_size_embed: 256           # frames per CLIP embedding batch
 
 retrieval:
-  index_type: "flat"
-  top_k_coarse: 64
-  similarity: "cosine"
+  model_name: "ViT-B-32"         # OpenCLIP model name
+  pretrained: "laion2b_s34b_b79k" # OpenCLIP pretrained weights tag
+  top_k_coarse: 64               # Stage 1: frames retrieved per query
+  embed_dim: 512                  # CLIP embedding dimension
+  faiss_metric: "ip"              # inner product (embeddings are L2-normalised)
 
-ranker:
-  embed_dim: 512
-  num_heads: 8
-  num_layers: 3
+ranking:
+  num_layers: 4                   # cross-attention transformer layers
+  num_heads: 8                    # attention heads
+  hidden_dim: 512                 # transformer hidden dim (= CLIP embed_dim)
+  ffn_dim: 2048                   # feedforward dim in transformer
   dropout: 0.1
-  top_k_fine: 8
-
-dpp:
-  lambda_diversity: 0.5
-  max_iter: 100
-
-adaptive:
-  enabled: true
-  uncertainty_threshold: 0.4
-  num_frames_low: 8
-  num_frames_high: 16
+  top_k_fine_low: 8              # frames selected when confidence HIGH
+  top_k_fine_high: 16            # frames selected when confidence LOW
+  uncertainty_threshold: 0.3     # below → use 8 frames, above → use 16
+  dpp_lambda: 0.5                 # temporal diversity penalty in DPP kernel
 
 training:
-  epochs: 10
-  batch_size: 32
-  learning_rate: 1.0e-4
+  lr: 3.0e-4
   weight_decay: 1.0e-4
-  warmup_steps: 500
+  epochs: 3
+  batch_size: 32                  # number of videos per batch
   grad_clip: 1.0
-  mixed_precision: true
-  save_every_n_epochs: 2
-  eval_every_n_epochs: 1
+  warmup_steps: 200
+  save_every_n_steps: 500
+  val_every_n_steps: 500
+  loss_rank_weight: 1.0
+  loss_uncertainty_weight: 0.5
+  num_workers: 4
+  seed: 42
+  fp16: true
 
 vlm:
   model_id: "llava-hf/llava-1.5-7b-hf"
   load_in_4bit: true
-  max_new_tokens: 128
-  temperature: 0.0
+  max_new_tokens: 16
+  device_map: "auto"
 
 paths:
   data_root: "data"
-  results_root: "results"
-  checkpoint_dir: "results/checkpoints"
-  log_dir: "results/logs"
-
-logging:
-  level: "INFO"
-  use_tensorboard: true
+  raw_videos: "data/raw/nextqa/videos"      # put your downloaded .mp4s here
+  annotations: "data/raw/nextqa/annotations"
+  frames_root: "data/processed/nextqa/frames"
+  embeddings_dir: "data/processed/nextqa/embeddings"
+  index_dir: "data/processed/nextqa/faiss"
+  checkpoints: "results/checkpoints"
+  results: "results/eval"
+  logs: "results/logs"
