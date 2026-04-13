@@ -1,0 +1,15 @@
+# configs/nextqa.yaml — overrides for NExT-QA benchmark
+defaults:
+  - base
+
+data:
+  dataset: "nextqa"
+  raw_dir: "data/raw/nextqa"
+  processed_dir: "data/processed/nextqa"
+  embeddings_dir: "data/embeddings/nextqa"
+  index_dir: "data/indexes/nextqa"
+  annotation_file: "data/raw/nextqa/annotations/nextqa_val.csv"
+
+training:
+  epochs: 10
+  batch_size: 32

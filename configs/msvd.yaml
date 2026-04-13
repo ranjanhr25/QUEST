@@ -1,0 +1,15 @@
+# configs/msvd.yaml — overrides for MSVD-QA (good for fast iteration)
+defaults:
+  - base
+
+data:
+  dataset: "msvd"
+  raw_dir: "data/raw/msvd"
+  processed_dir: "data/processed/msvd"
+  embeddings_dir: "data/embeddings/msvd"
+  index_dir: "data/indexes/msvd"
+  fps: 2
+
+training:
+  epochs: 5
+  batch_size: 64

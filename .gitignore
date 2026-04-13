@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Data — never commit raw data or embeddings
+data/raw/
+data/processed/
+data/embeddings/
+data/indexes/
+
+# Results — commit only summaries, not checkpoints/logs
+results/checkpoints/
+results/logs/
+results/ablations/*.json
+!results/ablations/.gitkeep
+
+# Notebooks output (clear before committing)
+notebooks/.ipynb_checkpoints/
+
+# Environment files
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Weights & Biases
+wandb/
+
+# Keep empty dirs tracked
+!results/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/embeddings/.gitkeep
+!data/indexes/.gitkeep

@@ -1,0 +1,62 @@
+# configs/base.yaml
+# Default hyperparameters — dataset-specific configs override these
+
+data:
+  fps: 1
+  max_frames_per_video: 1000
+  frame_size: 224
+
+clip:
+  model_name: "ViT-B-32"
+  pretrained: "openai"
+  batch_size: 256
+  device: "cuda"
+
+retrieval:
+  index_type: "flat"
+  top_k_coarse: 64
+  similarity: "cosine"
+
+ranker:
+  embed_dim: 512
+  num_heads: 8
+  num_layers: 3
+  dropout: 0.1
+  top_k_fine: 8
+
+dpp:
+  lambda_diversity: 0.5
+  max_iter: 100
+
+adaptive:
+  enabled: true
+  uncertainty_threshold: 0.4
+  num_frames_low: 8
+  num_frames_high: 16
+
+training:
+  epochs: 10
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  grad_clip: 1.0
+  mixed_precision: true
+  save_every_n_epochs: 2
+  eval_every_n_epochs: 1
+
+vlm:
+  model_id: "llava-hf/llava-1.5-7b-hf"
+  load_in_4bit: true
+  max_new_tokens: 128
+  temperature: 0.0
+
+paths:
+  data_root: "data"
+  results_root: "results"
+  checkpoint_dir: "results/checkpoints"
+  log_dir: "results/logs"
+
+logging:
+  level: "INFO"
+  use_tensorboard: true

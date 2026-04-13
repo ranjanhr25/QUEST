@@ -1,0 +1,47 @@
+# Core deep learning
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.37.0
+accelerate>=0.26.0
+
+# CLIP encoder
+open-clip-torch>=2.23.0
+
+# Vector index
+faiss-cpu>=1.7.4          # use faiss-gpu if you have a persistent GPU environment
+
+# VLM inference (4-bit quantization)
+bitsandbytes>=0.41.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+
+# Video processing
+ffmpeg-python>=0.2.0
+opencv-python-headless>=4.8.0
+scenedetect[opencv]>=0.6.2  # PySceneDetect for shot boundary detection
+
+# Data and config
+datasets>=2.16.0
+hydra-core>=1.3.0
+omegaconf>=2.3.0
+pyyaml>=6.0
+
+# Numerics
+numpy>=1.24.0
+scipy>=1.11.0              # used for DPP eigendecomposition
+
+# Experiment tracking (free, no account needed for local runs)
+tensorboard>=2.14.0
+
+# Utilities
+tqdm>=4.66.0
+Pillow>=10.0.0
+einops>=0.7.0              # readable tensor operations in ranker
+rich>=13.0.0               # pretty CLI output
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Development (install with: pip install -e ".[dev]")
+# black, isort, flake8 listed in pyproject.toml [dev] extras
