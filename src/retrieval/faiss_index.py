@@ -1,105 +1,239 @@
 """
-FAISS vector index for fast frame retrieval.
+FAISS-based coarse retrieval index for QUEST.
 
-FAISS (Facebook AI Similarity Search) provides fast approximate nearest
-neighbour (ANN) search over large embedding databases.
+Builds a per-video or global FAISS index over CLIP frame embeddings,
+then retrieves the top-K most relevant frames for a query embedding.
 
-INDEX TYPES (controlled via config):
-  - "flat":  Exact brute-force search. Accurate but O(N) per query.
-             Use for datasets with < 100k frames total.
-  - "ivf":   Inverted file index. ~10× faster, slight accuracy drop.
-             Use when flat is too slow (> 500k frames).
+We use IndexFlatIP (exact inner product) since embeddings are L2-normalised
+(inner product = cosine similarity). No approximate search needed here —
+per-video retrieval is over at most ~4500 frames which is cheap.
 
-WHY CPU FAISS:
-  faiss-cpu is sufficient here because we query per-video (not across
-  the full dataset at once). The index for a single 10-minute video at
-  1 fps has only ~600 vectors — brute-force search on that is microseconds.
+Usage:
+    builder = FAISSIndexBuilder.from_config(cfg)
+    builder.build()          # builds and saves per-video FAISS indexes
+
+    retriever = FAISSRetriever.from_config(cfg)
+    frame_indices, scores = retriever.retrieve(video_id, query_emb, top_k=64)
 """
+
 from __future__ import annotations
 
-import faiss
-import numpy as np
+import json
 from pathlib import Path
+from typing import Any
 
+import numpy as np
+
+from src.utils.io_utils import load_video_index, open_memmap
 from src.utils.logger import get_logger
 
-logger = get_logger(__name__)
+log = get_logger("faiss_index")
 
 
-class FrameIndex:
+def _check_faiss() -> Any:
+    try:
+        import faiss
+        return faiss
+    except ImportError:
+        raise ImportError(
+            "faiss not installed. Run: conda install -c pytorch faiss-cpu  "
+            "or: pip install faiss-cpu"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
+class FAISSIndexBuilder:
     """
-    FAISS-backed index for a single video's frame embeddings.
+    Builds per-video FAISS IndexFlatIP indexes and saves them to disk.
 
-    Args:
-        embed_dim:   Dimensionality of embeddings (512 for ViT-B/32).
-        index_type:  "flat" or "ivf".
-
-    Example:
-        >>> index = FrameIndex(embed_dim=512)
-        >>> index.add(frame_embeddings)        # shape (N, 512)
-        >>> scores, indices = index.search(query_emb, k=64)
+    Instead of one monolithic index we keep per-video indexes so that
+    retrieval is naturally scoped: given a question about video X we only
+    search frames from video X.
     """
 
-    def __init__(self, embed_dim: int = 512, index_type: str = "flat"):
+    def __init__(
+        self,
+        embeddings_path: Path,
+        video_index_path: Path,
+        output_dir: Path,
+        embed_dim: int = 512,
+    ) -> None:
+        self.embeddings_path = embeddings_path
+        self.video_index_path = video_index_path
+        self.output_dir = output_dir
         self.embed_dim = embed_dim
-        self.index_type = index_type
-        self._index: faiss.Index | None = None
 
-    def build(self, embeddings: np.ndarray) -> None:
+    @classmethod
+    def from_config(cls, cfg: Any) -> "FAISSIndexBuilder":
+        emb_dir = Path(cfg.paths.embeddings_dir)
+        return cls(
+            embeddings_path=emb_dir / "frame_embeddings.npy",
+            video_index_path=emb_dir / "video_index.json",
+            output_dir=Path(cfg.paths.index_dir),
+            embed_dim=cfg.retrieval.embed_dim,
+        )
+
+    def build(self, force: bool = False) -> None:
+        faiss = _check_faiss()
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        video_index = load_video_index(self.video_index_path)
+
+        # Load embeddings (read-only memmap)
+        total_rows = max(end for _, end in video_index.values())
+        emb_arr = open_memmap(
+            self.embeddings_path,
+            shape=(total_rows, self.embed_dim),
+            dtype=np.float16,
+            mode="r",
+        )
+
+        skipped, built = 0, 0
+        for vid_id, (start, end) in video_index.items():
+            out_path = self.output_dir / f"{vid_id}.index"
+            if out_path.exists() and not force:
+                skipped += 1
+                continue
+
+            n_frames = end - start
+            if n_frames == 0:
+                continue
+
+            vecs = emb_arr[start:end].astype(np.float32)  # faiss needs float32
+            # Ensure L2-normalised (should already be from encoder)
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            vecs = vecs / np.maximum(norms, 1e-8)
+
+            index = faiss.IndexFlatIP(self.embed_dim)
+            index.add(vecs)
+            faiss.write_index(index, str(out_path))
+            built += 1
+
+        log.info("FAISS indexes done", built=built, skipped=skipped, total=len(video_index))
+
+        # Write a global manifest
+        manifest_path = self.output_dir / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump({"embed_dim": self.embed_dim, "n_videos": len(video_index)}, f)
+
+
+# ---------------------------------------------------------------------------
+# Retriever
+# ---------------------------------------------------------------------------
+
+class FAISSRetriever:
+    """
+    Loads per-video FAISS indexes on demand and performs retrieval.
+
+    Indexes are cached in memory after first load.
+    """
+
+    def __init__(
+        self,
+        index_dir: Path,
+        video_index_path: Path,
+        embeddings_path: Path,
+        embed_dim: int = 512,
+    ) -> None:
+        faiss = _check_faiss()
+        self.faiss = faiss
+        self.index_dir = index_dir
+        self.embed_dim = embed_dim
+        self.video_index = load_video_index(video_index_path)
+
+        total_rows = max(end for _, end in self.video_index.values())
+        self.emb_arr = open_memmap(
+            embeddings_path,
+            shape=(total_rows, embed_dim),
+            dtype=np.float16,
+            mode="r",
+        )
+
+        self._cache: dict[str, Any] = {}  # video_id → faiss index
+
+    @classmethod
+    def from_config(cls, cfg: Any) -> "FAISSRetriever":
+        emb_dir = Path(cfg.paths.embeddings_dir)
+        return cls(
+            index_dir=Path(cfg.paths.index_dir),
+            video_index_path=emb_dir / "video_index.json",
+            embeddings_path=emb_dir / "frame_embeddings.npy",
+            embed_dim=cfg.retrieval.embed_dim,
+        )
+
+    def _load_index(self, video_id: str) -> Any | None:
+        if video_id in self._cache:
+            return self._cache[video_id]
+        path = self.index_dir / f"{video_id}.index"
+        if not path.exists():
+            return None
+        idx = self.faiss.read_index(str(path))
+        self._cache[video_id] = idx
+        return idx
+
+    def retrieve(
+        self,
+        video_id: str,
+        query_emb: np.ndarray,
+        top_k: int = 64,
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Build the index from a matrix of frame embeddings.
+        Retrieve top_k frame indices (relative to video) and their scores.
 
         Args:
-            embeddings: Float32 array of shape (N, embed_dim).
-                        Must be L2-normalised (CLIPEncoder ensures this).
-        """
-        embeddings = embeddings.astype(np.float32)
-        N = embeddings.shape[0]
-
-        if self.index_type == "flat":
-            # Inner product on L2-normalised vectors == cosine similarity
-            self._index = faiss.IndexFlatIP(self.embed_dim)
-        elif self.index_type == "ivf":
-            nlist = min(int(N ** 0.5), 128)   # number of Voronoi cells
-            quantizer = faiss.IndexFlatIP(self.embed_dim)
-            self._index = faiss.IndexIVFFlat(quantizer, self.embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            self._index.train(embeddings)
-        else:
-            raise ValueError(f"Unknown index_type: {self.index_type}")
-
-        self._index.add(embeddings)
-        logger.debug(f"FAISS index built: {N} vectors, type={self.index_type}")
-
-    def search(self, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Find top-k most similar frames to a query embedding.
-
-        Args:
-            query: Float32 array of shape (embed_dim,) or (1, embed_dim).
-            k:     Number of results to return.
+            video_id: string video ID.
+            query_emb: (embed_dim,) L2-normalised float32 vector.
+            top_k: number of frames to return.
 
         Returns:
-            Tuple of (scores, indices):
-              - scores:  shape (k,) cosine similarity values
-              - indices: shape (k,) integer frame indices into the original embedding array
+            frame_indices: (top_k,) int array — indices relative to video start.
+            scores:        (top_k,) float32 similarity scores.
         """
-        if self._index is None:
-            raise RuntimeError("Index not built. Call .build(embeddings) first.")
+        index = self._load_index(video_id)
+        if index is None:
+            log.warning("FAISS index not found", video_id=video_id)
+            return np.array([], dtype=np.int64), np.array([], dtype=np.float32)
 
-        query = query.astype(np.float32)
-        if query.ndim == 1:
-            query = query[np.newaxis, :]
+        q = query_emb.astype(np.float32).reshape(1, -1)
+        # Normalise query just in case
+        q = q / (np.linalg.norm(q) + 1e-8)
 
-        scores, indices = self._index.search(query, k)
-        return scores[0], indices[0]
+        n_frames = index.ntotal
+        k = min(top_k, n_frames)
+        scores, local_indices = index.search(q, k)  # (1, k)
+        return local_indices[0], scores[0]
 
-    def save(self, path: str) -> None:
-        """Persist the index to disk."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self._index, str(path))
-        logger.info(f"FAISS index saved → {path}")
+    def retrieve_embeddings(
+        self,
+        video_id: str,
+        query_emb: np.ndarray,
+        top_k: int = 64,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Like retrieve() but also returns the frame embeddings.
 
-    def load(self, path: str) -> None:
-        """Load a previously saved index from disk."""
-        self._index = faiss.read_index(str(path))
-        logger.info(f"FAISS index loaded ← {path}")
+        Returns:
+            frame_indices: (K,) relative to video.
+            frame_embs:    (K, embed_dim) float32.
+            scores:        (K,) float32.
+        """
+        local_indices, scores = self.retrieve(video_id, query_emb, top_k)
+        if len(local_indices) == 0:
+            return local_indices, np.zeros((0, self.embed_dim), dtype=np.float32), scores
+
+        start, end = self.video_index.get(video_id, (0, 0))
+        global_indices = start + local_indices
+        # Clamp to valid range
+        global_indices = np.clip(global_indices, 0, end - 1)
+        embs = self.emb_arr[global_indices].astype(np.float32)
+        return local_indices, embs, scores
+
+    def get_all_frame_embs(self, video_id: str) -> np.ndarray:
+        """Return ALL frame embeddings for a video (shape: N × embed_dim)."""
+        start, end = self.video_index.get(video_id, (0, 0))
+        if end <= start:
+            return np.zeros((0, self.embed_dim), dtype=np.float32)
+        return self.emb_arr[start:end].astype(np.float32)

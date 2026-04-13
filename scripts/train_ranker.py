@@ -1,119 +1,179 @@
+#!/usr/bin/env python3
 """
-Train the cross-modal TemporalRanker.
+Train the cross-modal transformer ranker for QUEST.
 
-Run this on Kaggle (2x T4) or Colab free T4.
-Expected training time: 2–3 hours for NExT-QA, 10 epochs.
+Designed to run on:
+  - Kaggle 2×T4   (recommended — 2×16GB, ~3h for 3 epochs)
+  - Google Colab T4  (1×16GB, ~5h for 3 epochs)
+  - Local GPU (any 8GB+)
 
 Usage:
+    # Train from scratch
     python scripts/train_ranker.py --config configs/nextqa.yaml
-    python scripts/train_ranker.py --config configs/msvd.yaml --override training.epochs=3
+
+    # Resume from latest checkpoint
+    python scripts/train_ranker.py --config configs/nextqa.yaml --resume
+
+    # Quick smoke-test (100 train, 50 val samples, 1 epoch)
+    python scripts/train_ranker.py --config configs/nextqa.yaml --smoke_test
+
+Prerequisites (run first):
+    python -m src.data.frame_extractor  ...   # extract frames
+    python -m src.data.preprocess       ...   # compute CLIP embeddings
+    python scripts/build_index.py       ...   # build FAISS indexes
 """
+
+from __future__ import annotations
+
 import argparse
+import random
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
 
-from src.utils.config import load_config
+from src.data.dataset import NExTQADataset, RankerTrainDataset
+from src.ranking.fine_ranker import RankerTrainer
+from src.utils.config import load_config, ensure_dirs
 from src.utils.logger import get_logger
-from src.utils.io_utils import save_checkpoint, load_embeddings_memmap
-from src.models.temporal_ranker import TemporalRanker, contrastive_ranking_loss
 
-logger = get_logger(__name__, log_dir="results/logs")
+log = get_logger("train_ranker")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train QUEST temporal ranker")
-    parser.add_argument("--config", required=True, help="Path to dataset config yaml")
-    parser.add_argument("--override", nargs="*", default=[], help="Config overrides key=val")
-    parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
-    return parser.parse_args()
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-def main():
-    args = parse_args()
-    cfg = load_config(args.config, overrides=args.override)
+def build_loaders(
+    cfg: object,
+    smoke_test: bool = False,
+) -> tuple[DataLoader, DataLoader]:
+    """Build train and val DataLoaders for the RankerTrainDataset."""
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"Training on {device}")
+    ann_dir  = Path(cfg.paths.annotations)
+    emb_dir  = Path(cfg.paths.embeddings_dir)
+    frame_idx = Path(cfg.paths.frames_root).parent / "frame_index.json"
 
-    # ── Model ─────────────────────────────────────────────────────────────────
-    model = TemporalRanker(
-        embed_dim=cfg.ranker.embed_dim,
-        num_heads=cfg.ranker.num_heads,
-        num_layers=cfg.ranker.num_layers,
-        dropout=cfg.ranker.dropout,
-    ).to(device)
+    train_ann = ann_dir / cfg.annotation_files["train"]
+    val_ann   = ann_dir / cfg.annotation_files["val"]
 
-    # DataParallel on Kaggle 2×T4
-    if torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs (DataParallel)")
-        model = torch.nn.DataParallel(model)
+    for p in [train_ann, val_ann, frame_idx,
+              emb_dir / "frame_embeddings.npy",
+              emb_dir / "video_index.json"]:
+        if not Path(p).exists():
+            log.error("Required file missing", path=str(p))
+            sys.exit(1)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.weight_decay,
+    # Base datasets
+    train_base = NExTQADataset(train_ann, frame_idx, split="train")
+    val_base   = NExTQADataset(val_ann,   frame_idx, split="val")
+
+    if smoke_test:
+        train_base = train_base.stratified_subset(100)
+        val_base   = val_base.stratified_subset(50)
+        log.info("Smoke test: subsampled datasets", train=len(train_base), val=len(val_base))
+
+    common_kwargs = dict(
+        embeddings_path=emb_dir / "frame_embeddings.npy",
+        video_index_path=emb_dir / "video_index.json",
+        top_k_positive=3,
+        n_candidates=cfg.retrieval.top_k_coarse,
+        embed_dim=cfg.retrieval.embed_dim,
     )
-    scaler = GradScaler(enabled=cfg.training.mixed_precision)
 
-    start_epoch = 0
-    if args.resume:
-        from src.utils.io_utils import load_checkpoint
-        ckpt = load_checkpoint(model, args.resume, optimizer, device)
-        start_epoch = ckpt["epoch"] + 1
+    train_ds = RankerTrainDataset(
+        base_dataset=train_base,
+        question_embeddings_path=emb_dir / "question_embeddings_train.npy",
+        question_index_path=emb_dir / "question_index_train.json",
+        **common_kwargs,
+    )
+    val_ds = RankerTrainDataset(
+        base_dataset=val_base,
+        question_embeddings_path=emb_dir / "question_embeddings_val.npy",
+        question_index_path=emb_dir / "question_index_val.json",
+        **common_kwargs,
+    )
 
-    # ── Training loop (pseudocode — replace DataLoader with your actual dataset) ──
-    logger.info("Starting training…")
-    best_val_acc = 0.0
+    nw = cfg.training.num_workers if not smoke_test else 0
+    bs = cfg.training.batch_size
 
-    for epoch in range(start_epoch, cfg.training.epochs):
-        model.train()
-        epoch_loss = 0.0
-        num_batches = 0
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=bs,
+        shuffle=True,
+        num_workers=nw,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        persistent_workers=(nw > 0),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=bs,
+        shuffle=False,
+        num_workers=nw,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-        # TODO: replace with your actual DataLoader over precomputed embeddings
-        # Each batch should provide:
-        #   question_emb: (B, 512), frame_embs: (B, K, 512),
-        #   temporal_pos: (B, K, 3), labels: (B, K)
-        logger.info(f"Epoch {epoch+1}/{cfg.training.epochs} — replace this with real DataLoader")
-        break   # Remove this break once DataLoader is connected
+    log.info(
+        "DataLoaders ready",
+        train_samples=len(train_ds),
+        val_samples=len(val_ds),
+        train_batches=len(train_loader),
+        batch_size=bs,
+    )
+    return train_loader, val_loader
 
-        for batch in train_loader:
-            question_emb = batch["question_emb"].to(device)
-            frame_embs = batch["frame_embs"].to(device)
-            temporal_pos = batch["temporal_pos"].to(device)
-            labels = batch["labels"].to(device)
 
-            optimizer.zero_grad()
-            with autocast(enabled=cfg.training.mixed_precision):
-                scores, uncertainty = model(question_emb, frame_embs, temporal_pos)
-                loss = contrastive_ranking_loss(scores, labels)
+def main() -> None:
+    p = argparse.ArgumentParser(description="Train the QUEST temporal ranker.")
+    p.add_argument("--config",     default="configs/nextqa.yaml", type=Path)
+    p.add_argument("--resume",     action="store_true", help="Resume from latest checkpoint")
+    p.add_argument("--smoke_test", action="store_true", help="Quick run to verify the pipeline")
+    p.add_argument("--epochs",     default=None, type=int, help="Override training.epochs")
+    p.add_argument("--batch_size", default=None, type=int, help="Override training.batch_size")
+    args = p.parse_args()
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.training.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+    cfg = load_config(args.config)
+    ensure_dirs(cfg)
 
-            epoch_loss += loss.item()
-            num_batches += 1
+    if args.epochs is not None:
+        cfg.training["epochs"] = args.epochs
+    if args.batch_size is not None:
+        cfg.training["batch_size"] = args.batch_size
+    if args.smoke_test:
+        cfg.training["epochs"] = 1
 
-        avg_loss = epoch_loss / max(num_batches, 1)
-        logger.info(f"Epoch {epoch+1} | loss={avg_loss:.4f}")
+    set_seed(cfg.training.seed)
 
-        if (epoch + 1) % cfg.training.save_every_n_epochs == 0:
-            save_checkpoint(
-                model, optimizer, epoch,
-                metrics={"train_loss": avg_loss},
-                save_path=f"{cfg.paths.checkpoint_dir}/epoch_{epoch+1}.pt",
-            )
+    log.info(
+        "Training configuration",
+        epochs=cfg.training.epochs,
+        batch_size=cfg.training.batch_size,
+        lr=cfg.training.lr,
+        fp16=cfg.training.fp16,
+        gpus=torch.cuda.device_count(),
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
 
-    logger.info("Training complete")
+    train_loader, val_loader = build_loaders(cfg, smoke_test=args.smoke_test)
+
+    trainer = RankerTrainer.from_config(cfg)
+    trainer.train(train_loader, val_loader, resume=args.resume)
+
+    # Final validation metrics
+    log.info("Running final validation...")
+    final_metrics = trainer.evaluate(val_loader)
+    log.info("Final validation metrics", **{k: round(v, 4) for k, v in final_metrics.items()})
+
+    log.info("train_ranker.py complete")
 
 
 if __name__ == "__main__":

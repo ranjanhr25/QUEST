@@ -1,15 +1,34 @@
-# configs/nextqa.yaml — overrides for NExT-QA benchmark
-defaults:
-  - base
+# NExT-QA specific config — inherits base.yaml, overrides as needed.
 
-data:
-  dataset: "nextqa"
-  raw_dir: "data/raw/nextqa"
-  processed_dir: "data/processed/nextqa"
-  embeddings_dir: "data/embeddings/nextqa"
-  index_dir: "data/indexes/nextqa"
-  annotation_file: "data/raw/nextqa/annotations/nextqa_val.csv"
+dataset: "nextqa"
+splits:
+  train: "train"
+  val: "val"
+  test: "val"           # official test labels are hidden; use val for full evaluation
+
+# NExT-QA annotation CSV columns (official repo format):
+# video, frame_count, width, height, question, answer, qid, type, a0, a1, a2, a3, a4
+annotation_files:
+  train: "train.csv"
+  val: "val.csv"
+
+# question types in NExT-QA
+question_types:
+  causal: ["CW", "CH"]
+  temporal: ["TN", "TC"]
+  descriptive: ["DL", "DC", "DO"]
+  all: ["CW", "CH", "TN", "TC", "DL", "DC", "DO"]
+
+# map_vid_vidorID.json maps int video_id → VidOR subpath e.g. "0001/3088734333.mp4"
+# Place this file at data/raw/nextqa/annotations/map_vid_vidorID.json
+# (cloned from https://github.com/doc-doc/NExT-QA dataset/nextqa/)
+vid_map_file: "map_vid_vidorID.json"
+
+# videos can be organised as flat dir OR VidOR subdirs — auto-detected
+video_layout: "auto"   # "flat" | "vidor" | "auto"
 
 training:
-  epochs: 10
-  batch_size: 32
+  epochs: 3
+  batch_size: 16        # reduce if OOM on single T4
+  num_workers: 4
+  fp16: true
