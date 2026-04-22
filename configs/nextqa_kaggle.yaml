@@ -1,0 +1,27 @@
+# configs/nextqa_kaggle.yaml
+dataset: nextqa
+annotation_files:
+  train: train.csv
+  val: val.csv
+splits:
+  train: train
+  val: val
+  test: val
+vid_map_file: map_vid_vidorID.json
+training:
+  epochs: 3
+  batch_size: 16
+  num_workers: 4
+  fp16: true
+
+# Paths are Kaggle-specific — local runs use configs/nextqa.yaml instead
+paths:
+  data_root: /kaggle/working
+  raw_videos: /kaggle/input/datasets/ranjanhr/nextqa-frames/frames
+  annotations: /kaggle/input/datasets/ranjanhr/nextqa-annotations/data/raw/nextqa/annotations
+  frames_root: /kaggle/working/frames/placeholder
+  embeddings_dir: /kaggle/working/embeddings
+  index_dir: /kaggle/working/indexes
+  checkpoints: /kaggle/working/checkpoints
+  results: /kaggle/working/results
+  logs: /kaggle/working/logs

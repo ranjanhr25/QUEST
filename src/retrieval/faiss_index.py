@@ -237,3 +237,41 @@ class FAISSRetriever:
         if end <= start:
             return np.zeros((0, self.embed_dim), dtype=np.float32)
         return self.emb_arr[start:end].astype(np.float32)
+    
+class FrameIndex:
+    """
+    Lightweight single-video FAISS index used by demo.py and tests.
+    Wraps IndexFlatIP for a single set of frame embeddings.
+    """
+
+    def __init__(self, embed_dim: int = 512, index_type: str = "flat") -> None:
+        self.embed_dim = embed_dim
+        self.index_type = index_type
+        self._index = None
+
+    def build(self, embeddings: np.ndarray) -> None:
+        faiss = _check_faiss()
+        vecs = embeddings.astype(np.float32)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        vecs = vecs / np.maximum(norms, 1e-8)
+        self._index = faiss.IndexFlatIP(self.embed_dim)
+        self._index.add(vecs)
+
+    def search(
+        self, query: np.ndarray, k: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self._index is None:
+            raise RuntimeError("Index not built — call build() first")
+        q = query.astype(np.float32).reshape(1, -1)
+        q = q / (np.linalg.norm(q) + 1e-8)
+        k = min(k, self._index.ntotal)
+        scores, indices = self._index.search(q, k)
+        return scores[0], indices[0]
+
+    def save(self, path: str) -> None:
+        faiss = _check_faiss()
+        faiss.write_index(self._index, str(path))
+
+    def load(self, path: str) -> None:
+        faiss = _check_faiss()
+        self._index = faiss.read_index(str(path))

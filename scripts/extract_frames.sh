@@ -32,6 +32,10 @@
 
 set -euo pipefail
 
+# --- Force correct conda env ---
+CONDA_ENV="/d/Anaconda/envs/quest"
+
+export PATH="$CONDA_ENV:$CONDA_ENV/Scripts:$CONDA_ENV/Library/bin:$PATH"
 # ── Defaults ──────────────────────────────────────────────────────────────
 VIDEO_DIR="${VIDEO_DIR:-data/raw/nextqa/videos}"
 OUTPUT_DIR="${OUTPUT_DIR:-data/processed/nextqa/frames}"
@@ -48,10 +52,6 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 # ── Checks ────────────────────────────────────────────────────────────────
-if ! command -v ffmpeg &>/dev/null; then
-    echo "[ERROR] ffmpeg not found. Install with: conda install -c conda-forge ffmpeg"
-    exit 1
-fi
 
 if [[ ! -d "${VIDEO_DIR}" ]]; then
     echo "[ERROR] VIDEO_DIR does not exist: ${VIDEO_DIR}"
