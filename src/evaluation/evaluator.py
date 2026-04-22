@@ -556,7 +556,3 @@ class QUESTEvaluator:
             else:
                 log.warning("Frame index out of range", idx=int(idx), n_paths=len(sorted_paths))
         return result
-
-
-# ── Optional: standalone type alias so evaluate.py import works cleanly ──
-Optional = type(None).__class_getitem__(type(None))  # re-export for type checkers
