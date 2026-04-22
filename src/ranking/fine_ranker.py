@@ -100,7 +100,7 @@ def uncertainty_bce_loss(
     uncertainty_gt: torch.Tensor,  # (B,) ground truth label {0.0, 1.0}
 ) -> torch.Tensor:
     """Binary cross-entropy on the uncertainty head."""
-    return F.binary_cross_entropy(uncertainty, uncertainty_gt.float())
+    return F.binary_cross_entropy(uncertainty.float(), uncertainty_gt.float())
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +220,6 @@ class RankerTrainer:
         n_epochs = cfg.epochs
         total_steps = n_epochs * len(train_loader)
 
-        # AFTER (fixed)
         pct_start = min(cfg.warmup_steps / max(total_steps, 1), 0.3)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
@@ -435,7 +434,7 @@ class RankerTrainer:
         r_loss = listnet_loss(pred_scores, relevance, pad_mask=pad_mask)
 
         # Uncertainty loss (BCE)
-        u_loss = uncertainty_bce_loss(pred_uncert, uncert_gt)
+        u_loss = uncertainty_bce_loss(pred_uncert.float(), uncert_gt)
 
         total = self.rank_weight * r_loss + self.uncert_weight * u_loss
 
