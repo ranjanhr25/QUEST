@@ -363,7 +363,12 @@ class RankerTrainer:
 
             if self.fp16:
                 with autocast():
-                    outputs, loss, rank_loss, uncert_loss = self._forward_loss(batch)
+                    outputs, loss, rank_loss, uncert_loss = self._forward_loss(batch, skip_uncert=True)
+                # Compute uncertainty loss outside autocast (BCE unsafe under fp16)
+                pred_uncert = outputs["uncertainty"].float()
+                uncert_gt = batch["uncertainty_gt"].to(self.device, non_blocking=True)
+                uncert_loss = uncertainty_bce_loss(pred_uncert, uncert_gt)
+                loss = loss + self.uncert_weight * uncert_loss
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
@@ -399,6 +404,7 @@ class RankerTrainer:
     def _forward_loss(
         self,
         batch: dict[str, Any],
+        skip_uncert: bool = False,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         One forward pass + loss computation.
@@ -433,10 +439,12 @@ class RankerTrainer:
         # Ranking loss (ListNet)
         r_loss = listnet_loss(pred_scores, relevance, pad_mask=pad_mask)
 
-        # Uncertainty loss (BCE)
-        u_loss = uncertainty_bce_loss(pred_uncert.float(), uncert_gt)
-
-        total = self.rank_weight * r_loss + self.uncert_weight * u_loss
+        if skip_uncert:
+            u_loss = torch.tensor(0.0, device=self.device)
+            total = self.rank_weight * r_loss
+        else:
+            u_loss = uncertainty_bce_loss(pred_uncert.float(), uncert_gt)
+            total = self.rank_weight * r_loss + self.uncert_weight * u_loss
 
         return outputs, total, r_loss, u_loss
 
