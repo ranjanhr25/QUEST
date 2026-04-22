@@ -220,12 +220,13 @@ class RankerTrainer:
         n_epochs = cfg.epochs
         total_steps = n_epochs * len(train_loader)
 
-        # Cosine schedule with linear warmup
+        # AFTER (fixed)
+        pct_start = min(cfg.warmup_steps / max(total_steps, 1), 0.3)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=cfg.lr,
             total_steps=total_steps,
-            pct_start=cfg.warmup_steps / total_steps,
+            pct_start=pct_start,
             anneal_strategy="cos",
         )
 
